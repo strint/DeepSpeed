@@ -78,26 +78,36 @@ def flatten_dense_tensors_sub_partition_aligned(tensor_list,
     return flat_tensors
 
 
+# s_note: 判断tensor和这个sub partition的inverval是否相交
 def _single_range_check(current_index, start_index, end_index, tensor_size):
+    # s_note: offset指交集的发生的位置距离current_index的offset
     offset = 0
     if (current_index >= start_index) and (current_index < end_index):
         # Fully inside bounds
+        # s_note: tensor的起点在这个interval，前进0就到达
         return True, offset
     elif (start_index > current_index) and (start_index < (current_index + tensor_size)):
         # Partially contained, compute offset
+        # s_note: sub partition的起点在tensor 的 interval，需要前进一个差值
         offset = start_index - current_index
         return True, offset
     else:
         return False, offset
 
 
+# s_note: current_index是当前tensor的起点index
+# 返回该参数关联的本rank所有要reduce的sub-partition
 def _range_check(current_index, element_intervals, tensor_size):
     results = []
+    # s_note: 遍历当前rank的各次通信的sub_partition的interval
     for comm_idx, interval in enumerate(element_intervals):
         start_index, end_index = interval
+        # s_note: 判断是否有交集，以及交集的发生的位置距离current_index的offset
         contained, offset = _single_range_check(current_index, start_index, end_index, tensor_size)
         if contained:
+            # s_note: 当前tensor在本rank关联的所有通信以及这次通信时，tensor对应数据的起始位置需要相对tensor初始位置current_index的偏移量
             results.append((contained, offset, comm_idx))
+    # s_note: 本rank不要reduce该参数
     if len(results) == 0:
         return [(False, 0, -1)]
     return results
@@ -229,7 +239,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                 self.best_max_elems_per_comm(
                     num_elements=sum(t.numel() for t in self.fp16_groups[i]),  # 一个para_group里面所有参数tensor里面的基础数据元素(fp16)个数总数
                     max_elements_per_comm=max_elements_per_comm,  # 一次通信最大的基础数据元素个数
-                    dp=dist.get_world_size(group=self.dp_process_group)  # 进程数/卡数
+                    dp=dist.get_world_size(group=self.dp_process_group)  # 进程数 or 卡数
                 ))
 
             # flattens all tensors into single 1d tensor aligned with sub-partition size for later dividing
@@ -291,7 +301,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                 fp32_sub_partition = sub_partition.clone().float().detach()
                 fp32_sub_partition.requires_grad = True
                 local_sub_partitions.append(fp32_sub_partition)
-            # s_notes: 记录本进程需要更新的参数分片
+            # s_notes: 记录本进程需要更新的fp32参数分片
             self.local_sub_partitions_of_fp32_groups.append(local_sub_partitions)
 
             # Compute sub_partition paddings
@@ -310,7 +320,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
 
             # RS: divide up the sub-partitions and keep track of offsets for each param
             # partition_size = len(self.fp16_groups_flat[i]) / dist.get_world_size(group=self.dp_process_group)
-            # 记录每个parameter的sub_partition和offset
+            # s_note: 记录每个rank的每次通信的每个分片关联的parameter及其通信时取数据相对tensor起点的offset
             params_in_rank_sub_partition, params_in_rank_sub_partitions_offsets, params_not_local = self.get_all_sub_partition_info(
                 tensor_list=self.fp16_groups[i],
                 all_element_intervals=element_intervals,
@@ -501,8 +511,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         return comm_partitions, sub_partitions, element_intervals, sub_partition_size, num_comm_intervals
 
     @staticmethod
-    def get_all_sub_partition_info(tensor_list,
-                                   all_element_intervals, # s_note: 从 self.get_data_parallel_sub_partitions 函数返回
+    def get_all_sub_partition_info(tensor_list, # s_note: 一个参数group的 fp16 参数list
+                                   all_element_intervals, # s_note: 从 self.get_data_parallel_sub_partitions 函数返回，一个rank每次通信要reduce的对应分片的起始index
                                    local_rank,
                                    world_size):
         params_not_local = []
@@ -511,6 +521,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         params_in_rank_sub_partition = []
         params_in_rank_sub_partitions_offsets = []
 
+        # s_note: 对于每个进程
         for rank in range(world_size):
             params_in_local_sub_partition = []
             local_sub_partition_offsets = []
@@ -518,11 +529,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             comm_offset_list = []
             current_index = 0
             prev_comm_idx = 0
+            # s_note: 对于当前参数group中的每个参数
             for iii, tensor in enumerate(tensor_list):
                 tensor_size = tensor.numel()
                 #if local_rank == 0:
                 #    # logger.info("rank={}, current_index={}, tensor_size={}, tensor-idx={}".format(rank,
                 #        current_index, tensor_size, iii))
+                # s_note: 本参数关联的rank的sub_partitions（以comm_idx和offset标识）
                 results_list = _range_check(current_index,
                                             all_element_intervals[rank],
                                             tensor_size)
@@ -532,28 +545,36 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                     #        offset, comm_idx))
                     if contained:
                         if prev_comm_idx != comm_idx:
+                            # s_note: 进入下次通信
                             params_in_local_sub_partition.append(comm_tensor_list)
                             comm_tensor_list = []
                             local_sub_partition_offsets.append(comm_offset_list)
                             comm_offset_list = []
+                        # s_note: 当前通信相关的
                         comm_tensor_list.append(tensor)
                         comm_offset_list.append(offset)
                         prev_comm_idx = comm_idx
                     elif rank == local_rank:
+                        # s_note: 该参数本rank无需更新
                         params_not_local.append(tensor)
 
                 current_index = current_index + tensor_size
 
             #assert len(comm_tensor_list) > 0
             #assert len(comm_offset_list) > 0
+            # comm -> list of parameter
+            # s_note: rank关联的每次通信要reduce grad的参数list
             params_in_local_sub_partition.append(comm_tensor_list)
+            # s_note: 关联参数grad通信时距离参数起点index的offset
             local_sub_partition_offsets.append(comm_offset_list)
 
+            # rank -> comm
             params_in_rank_sub_partition.append(params_in_local_sub_partition)
             params_in_rank_sub_partitions_offsets.append(local_sub_partition_offsets)
 
         return params_in_rank_sub_partition, params_in_rank_sub_partitions_offsets, params_not_local
 
+    # 返回的flat sub partition grad
     @staticmethod
     def get_flat_sub_partitions(comm_tensor_list,
                                 comm_param_offsets,
@@ -577,7 +598,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                     tensor.grad = torch.zeros(tensor.size(),
                                               dtype=tensor.dtype,
                                               device=tensor.device)
+                # s_note: 参数
                 param = tensor
+                # s_note: 参数的grad
                 tensor = tensor.grad
                 num_elements = tensor.numel()
                 tensor_offset = 0
@@ -595,6 +618,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                 #we need a narrow view of the tensor based on the tensor offset and number of elements that
                 #we need from this tensor
                 if tensor_offset > 0 or num_elements < tensor.numel():
+                    # s_note: 参数的梯度flatten
+                    # s_note: tesnor.view, 数据共享，解释方式不同 https://pytorch.org/docs/stable/tensor_view.html
+                    # s_note: 裁剪出该para的grad在该sub_partiton的部分
                     flat_tensor_list.append(tensor.contiguous().view(-1).narrow(
                         0,
                         int(tensor_offset),
@@ -626,6 +652,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             partition_params.append(my_params)  #flat_tensor_list)
             final_param_offsets.append(my_offsets)
             assert len(flat_tensor_list) == len(my_offsets), "{} {}".format(len(flat_tensor_list), len(my_offsets))
+            # s_note: flat sub partition grad
             flat_sub_partitions.append(_flatten_dense_tensors(flat_tensor_list))
         if num_comm_intervals is not None and len(
                 flat_sub_partitions) < num_comm_intervals:
@@ -668,6 +695,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             else:
                 p.grad = None
 
+    # s_note: loss.backward()之后的grad split & reduce-scatter
     def reduce_scatter_gradients(self,
                                  postscale_gradients,
                                  gradient_predivide_factor,
@@ -676,11 +704,17 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         local_rank = dist.get_rank(group=self.dp_process_group)
 
         for i, group in enumerate(self.fp16_groups):
+            # s_note: 对于第i个参数
+            # s_note: 获取其需要的通信次数
             num_comm_intervals = self.num_comm_intervals_per_group[i]
+
+            # 遍历world_size个进程
+            # 记录该参数的所有grad分片的view
             all_sub_partitions = []
             for rank in range(world_size):
                 # gsp is list of partitions indexed by comm_idx
-                # s_note: 获取本地对应 fp16 梯度分片
+                # s_note: 获取本进程本参数现有的 fp16 梯度分片的view
+                # s_note: comm -> fp16 sub partitions
                 grad_sub_partitions = self.get_flat_sub_partitions(
                     comm_tensor_list=self.params_in_rank_sub_partitions[i][rank],
                     comm_param_offsets=self.params_in_rank_sub_partitions_offsets[i]
@@ -689,14 +723,18 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                     default_device=self.default_device,
                     sub_partition_size=self.sub_partition_sizes[i],
                     num_comm_intervals=self.num_comm_intervals_per_group[i])
+                # rank -> comm
                 all_sub_partitions.append(grad_sub_partitions)
 
                 assert len(grad_sub_partitions) == num_comm_intervals
 
             local_comm_partitions = []
+            # s_note: 分为 num_comm_intervals 次通信
             for comm_idx in range(num_comm_intervals):
                 single_comm_all_partitions = []
                 for rank in range(world_size):
+                    # s_note: 汇总本次通信在本进程关联的多个grad分片
+                    # s_note: rank -> grad sub partitions
                     single_comm_all_partitions.append(all_sub_partitions[rank][comm_idx])
 
                 if postscale_gradients:
@@ -721,6 +759,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                                         input_list=single_comm_all_partitions,
                                         group=self.dp_process_group)
 
+    # s_note: stage 1 parameter update
     def step(self, closure=None):
         # First compute norm for all group so we know if there is overflow
         self.overflow = self.overflow_checker.check()
@@ -740,6 +779,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         local_sub_partitions_grad_groups = []
 
         partition_id = dist.get_rank(group=self.dp_process_group)
+        # s_note: 对于每个group的参数
         for i, group in enumerate(self.fp16_groups):
             #TODO RS: update get grad norm to support sub partitions
             norm_groups.append(get_grad_norm(group, mpu=self.mpu))
@@ -747,9 +787,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             #RS: update free grads w.r.t. sub partitions
             #free gradients for all the parameters that are not updated by this process
             # s_note: 这里释放了 fp16 的梯度? 这应该是 stege2 才要做的事情?
+            # s_note: 释放了本rank无需更新的参数的的fp16梯度
+            # s_note: 但是只要有一个分片在本rank，这里就没有释放其它无需更新的分片
             self.free_grad_in_param_list(self.params_not_local[i])
 
             # create flat gradient partitions for parameters updated by this process
+            # s_note: 本rank要更新的grad sub-partitons fp32
             local_grad_sub_partitions = self.get_flat_sub_partitions(
                 comm_tensor_list=self.params_in_rank_sub_partitions[i][partition_id],
                 comm_param_offsets=self.params_in_rank_sub_partitions_offsets[i]
