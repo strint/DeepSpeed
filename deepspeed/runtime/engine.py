@@ -92,6 +92,12 @@ def print_configuration(args, name):
         logger.info('  {} {} {}'.format(arg, dots, getattr(args, arg)))
 
 
+# s_note: DeepSpeed的使用
+# deepspeed.initialize，返回定制的DeepSpeedEngine模块
+# deepspeed module
+#  - forward()，前向
+#  - backward()，后向
+#  - step()，模型更新
 class DeepSpeedEngine(Module):
     r"""DeepSpeed engine for training.
     """
@@ -107,6 +113,7 @@ class DeepSpeedEngine(Module):
                  collate_fn=None,
                  config_params=None):
         super(DeepSpeedEngine, self).__init__()
+        # s_note: PyTorch原始的optimizer保存在client optimizer中
         self.client_optimizer = optimizer
         self.client_model_parameters = model_parameters
         self.client_lr_scheduler = lr_scheduler
@@ -123,6 +130,7 @@ class DeepSpeedEngine(Module):
         self.config_params = config_params
         self.loaded_checkpoint_mp_world_size = None
         self.loaded_checkpoint_dp_world_size = None
+        # s_note: 这个是默认打开的，optimizer.backward运行后，默认会运行 allreduce_gradients
         self.enable_backward_allreduce = True
         self.progressive_layer_drop = None
         self.dist_backend = "nccl"
@@ -567,6 +575,7 @@ class DeepSpeedEngine(Module):
                     logger.warning(
                         "**** You are using ZeRO with an untested optimizer, proceed with caution *****"
                     )
+            # s_note:生成zero的optimizer
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
         elif self.amp_enabled():
             assert not self.fp16_enabled(), "Cannot enable both amp with (legacy) fp16 mode"
@@ -674,6 +683,7 @@ class DeepSpeedEngine(Module):
         logger.info('Creating fp16 ZeRO stage {} optimizer'.format(zero_stage))
         assert not self.allreduce_always_fp32(), "ZeRO does not support 'fp32_allreduce': true"
         if zero_stage == ZERO_OPTIMIZATION_OPTIMIZER_STATES:
+            # s_note: stage 1 的optimizer
             assert self.zero_reduce_scatter(), 'Stage 1 only supports reduce scatter mode'
             optimizer = FP16_DeepSpeedZeroOptimizer_Stage1(
                 optimizer,
@@ -688,6 +698,7 @@ class DeepSpeedEngine(Module):
                 elastic_checkpoint=self.zero_elastic_checkpoint(),
                 mpu=self.mpu)
         elif zero_stage == ZERO_OPTIMIZATION_GRADIENTS:
+            # s_note: stage 2 的optimizer
             optimizer = FP16_DeepSpeedZeroOptimizer(
                 optimizer,
                 timers=self.timers,
@@ -707,6 +718,7 @@ class DeepSpeedEngine(Module):
                 gradient_predivide_factor=self.gradient_predivide_factor(),
                 gradient_accumulation_steps=self.gradient_accumulation_steps())
         else:
+            # s_note, stage 3不支持
             raise NotImplementedError("ZeRO stage {} not implemented".format(zero_stage))
 
         return optimizer
@@ -793,6 +805,8 @@ class DeepSpeedEngine(Module):
 
         return scaled_loss
 
+    # s_note: 前向计算
+    # s_note: 就是调用的PyTorch Module的forward方法
     def forward(self, *inputs, **kwargs):
         r"""Execute forward propagation
 
@@ -815,6 +829,7 @@ class DeepSpeedEngine(Module):
 
         if self.training_dataloader is None:
             self.tput_timer.start()
+        # s_note: 就是调用的PyTorch Module的forward方法
         loss = self.module(*inputs, **kwargs)
 
         if self.wall_clock_breakdown():
@@ -833,8 +848,10 @@ class DeepSpeedEngine(Module):
 
         return loss
 
+    # s_note: self.zero_optimizer.backward(loss)后执行的
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
         #Zero stage 2 communicates during non gradient accumulation boundaries as well
+        # s_note: stage 2 运行的reduce，非micro-batch end也执行
         if self.zero_optimization_partition_gradients():
             self.optimizer.overlapping_partition_gradients_reduce_epilogue()
 
@@ -842,6 +859,7 @@ class DeepSpeedEngine(Module):
         elif self.is_gradient_accumulation_boundary():
             if self.zero_optimization_stage() == ZERO_OPTIMIZATION_OPTIMIZER_STATES:
                 assert self.zero_reduce_scatter()
+                # s_note: stage 1 执行的reduce_scatter
                 self.optimizer.reduce_scatter_gradients(
                     postscale_gradients=self.postscale_gradients(),
                     gradient_predivide_factor=self.gradient_predivide_factor(),
@@ -849,6 +867,7 @@ class DeepSpeedEngine(Module):
             else:
                 self.buffered_allreduce_fallback(elements_per_buffer=bucket_size)
 
+    # s_note: 后向计算
     def backward(self, loss, allreduce_gradients=True, release_loss=False):
         r"""Execute backward pass on the loss
 
@@ -891,8 +910,10 @@ class DeepSpeedEngine(Module):
             self.timers('backward_inner').start()
 
         if self.zero_optimization():
+            # s_note: zero优化打开时执行的分支
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary(
             )
+            # s_note: backward这里调用的是zero_optimizer的backward(loss)
             self.optimizer.backward(loss)
         elif self.amp_enabled():
             # AMP requires delaying unscale when inside gradient accumulation boundaries
@@ -915,6 +936,7 @@ class DeepSpeedEngine(Module):
             self.timers('backward_allreduce_microstep').start()
             self.timers('backward_allreduce').start()
 
+        # s_note: 这个默认为True，所以会执行 gradient_allreduce
         if self.enable_backward_allreduce:
             self.allreduce_gradients()
 
@@ -990,6 +1012,7 @@ class DeepSpeedEngine(Module):
         self.global_steps += 1
         self.global_samples += self.train_batch_size()
 
+    # s_note: 模型更新
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation
         on effective_train_batch.
@@ -1007,6 +1030,7 @@ class DeepSpeedEngine(Module):
             if self.progressive_layer_drop:
                 self.progressive_layer_drop.update_state(self.global_steps)
 
+            # 在micro-batch的结尾，调用zero-optimizer的step，完成模型更新
             self._take_model_step(lr_kwargs)
 
         self.tput_timer.stop(report_progress)
