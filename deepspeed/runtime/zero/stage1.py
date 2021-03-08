@@ -199,31 +199,42 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
 
         # loop to deal with groups
         for i, param_group in enumerate(self.optimizer.param_groups):
-            # s_note: 什么是para_goups？参考：https://zhuanlan.zhihu.com/p/87209990
-            # optimizer初始化时传入params，被放到param_groups这里dict里面
-            # param_groups = [{'params': list(params)}]
+            # s_note: 什么是para_goups？
+            # 参考：https://pytorch.org/docs/stable/optim.html 和 https://zhuanlan.zhihu.com/p/87209990
+            # optimizer初始化时传入多组params，被放到param_groups这里List里面
+            # optim.SGD([
+            #    {'params': model.base.parameters()},
+            #    {'params': model.classifier.parameters(), 'lr': 1e-3}
+            #    ], lr=1e-2, momentum=0.9)
+            #
+            # param_groups = List[Dict[{'params': params_iter}, ...]]
             #
             # for group in self.param_groups:
+            #     # group 是个dict，其中有个key为params对应参数的iter
             #     weight_decay = group['weight_decay'] # 里面存了多组参数
             #     momentum = group['momentum']
             #     dampening = group['dampening']
             #     nesterov = group['nesterov']
+            #     # 遍历参数的iter，就拿到了参数tensor和其grad
             #     for p in group['params']:
             #         p 是optimizer关联的parameter tensor
             #         p.grad 是其梯度tensor
             # push this group to list before modify
-            # s_note: fp16_groups 中有完整的 parameters
+            # s_note: fp16_groups中有完整的fp16 parameters
             self.fp16_groups.append(param_group['params'])
 
             # calculate best max elements per comm based to minimize padding
+            # s_note: 该parameter tensor一次通信最大的element个数
             self.max_elems_per_comm.append(
                 self.best_max_elems_per_comm(
-                    num_elements=sum(t.numel() for t in self.fp16_groups[i]),
-                    max_elements_per_comm=max_elements_per_comm,
-                    dp=dist.get_world_size(group=self.dp_process_group)))
+                    num_elements=sum(t.numel() for t in self.fp16_groups[i]),  # 一个para_group里面所有参数tensor里面的基础数据元素(fp16)个数总数
+                    max_elements_per_comm=max_elements_per_comm,  # 一次通信最大的基础数据元素个数
+                    dp=dist.get_world_size(group=self.dp_process_group)  # 进程数/卡数
+                ))
 
             # flattens all tensors into single 1d tensor aligned with sub-partition size for later dividing
             # RS: create aligned sub-partitions
+            # s_note: 把所有参数打平成1d的tensor，并按sub-partition做对齐
             flat_aligned_params = flatten_dense_tensors_sub_partition_aligned(
                 tensor_list=self.fp16_groups[i],
                 dp=dist.get_world_size(group=self.dp_process_group),
@@ -238,11 +249,21 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             updated_params = _unflatten_dense_tensors(self.fp16_groups_flat[i],
                                                       self.fp16_groups[i])
             for p, q in zip(self.fp16_groups[i], updated_params):
+                # s_note: p这个parameter or variable的tensor（.data获取的）被替换为q的tensor
+                # .data接口：https://stackoverflow.com/questions/51743214/is-data-still-useful-in-pytorch
+                # 把fp16参数tensor映射到flat数据上
                 p.data = q.data
 
             # divide the flat weights into near equal partition equal to the data parallel degree
             # each process will compute on a different part of the partition
             # RS: split into two layer list -> [comm-id] -> [sub-partitions per rank]
+            # s_note: 对每个parameter，先按单次通信最大size切，然后按world_size再切，二维切分
+            # comm_id代表通信的编号，rank代表进程编号，sub_partition代表一次通信中对应进程数量个分片中的一片
+            # comm_partitions, [comm_id] -> List[sub_partition]，一次通信对应的多个分片
+            # dp_sub_partitions, [rank] -> List[sub_partition]，一个进程多次通信，每次要reduce的分片
+            # element_intervals, [rank] -> [(start_idx, end_idx), (start_idx, end_idx), ...]，对应dp_sub_partitions在flat数据中的index
+            # sub_partition_size，一个子partition的大小
+            # num_comm_intervals，通信次数
             comm_partitions, dp_sub_partitions, element_intervals, sub_partition_size, num_comm_intervals = \
                 self.get_data_parallel_sub_partitions(
                     tensor=self.fp16_groups_flat[i],
@@ -262,13 +283,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
 
             # a partition of the fp32 master weights that will be updated by this process
             # RS: store/detach/cast our local sub-partitions
+            # s_note: 本进程需要reduce的参数分片
             local_sub_partitions = []
             for sub_partition in self.parallel_sub_partitioned_fp16_groups[i][
                     local_rank]:
-                # s_note: 这里把分片参数转换为 fp32
+                # 创建了fp16分片对应的fp32分片，用于update
                 fp32_sub_partition = sub_partition.clone().float().detach()
                 fp32_sub_partition.requires_grad = True
                 local_sub_partitions.append(fp32_sub_partition)
+            # s_notes: 记录本进程需要更新的参数分片
             self.local_sub_partitions_of_fp32_groups.append(local_sub_partitions)
 
             # Compute sub_partition paddings
@@ -279,13 +302,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             self.group_paddings.append(sub_partition_paddings)
 
             # modify optimizer of have flat master weight
-            # self.single_partition_of_fp32_groups[i].requires_grad = True # keep this in case internal optimizer uses it
+            # self.local_partition_of_fp32_groups[i].requires_grad = True # keep this in case internal optimizer uses it
+            # s_note: 这里应该是self.local_sub_partitions_of_fp32_groups[i].requires_grad = True # keep this in case internal optimizer uses it
             # s_note: 这里 self.optimizer.param_groups 中的 params 被本地的fp32分片替换了
             #         而 self.fp16_groups 中保存着原来 self.optimizer 中的 fp16 param_group['params']
             param_group['params'] = self.local_sub_partitions_of_fp32_groups[i]
 
             # RS: divide up the sub-partitions and keep track of offsets for each param
             # partition_size = len(self.fp16_groups_flat[i]) / dist.get_world_size(group=self.dp_process_group)
+            # 记录每个parameter的sub_partition和offset
             params_in_rank_sub_partition, params_in_rank_sub_partitions_offsets, params_not_local = self.get_all_sub_partition_info(
                 tensor_list=self.fp16_groups[i],
                 all_element_intervals=element_intervals,
@@ -344,17 +369,34 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                                 dp # s_note: 数据并行进程数
                                 ): 
         # if we use max-elems-per-comm as is, how many comm intervals will there be
+        # s_note: 最大可能的通信次数，上取整
         max_comm_intervals = math.ceil(num_elements / max_elements_per_comm)
+        # s_note: 此时，最后一次通信需要padding，padding的元素数量
         padding_for_max_comm = (max_elements_per_comm *
                                 max_comm_intervals) - num_elements
 
         # if we use 1 less comm interval how much extra comm padding would be required
+        # s_note: 下取整，少一次通信，// 表示python 3的整数除法，/ 表示python 3的浮点除法
+        # 每次通信略超出上限的数量
         min_comm_intervals = num_elements // max_elements_per_comm
         if min_comm_intervals == 0:
+            # 下取整为0，表示本来就需要一次通信
             log_dist(f'Using default max_elements_per_comm {max_elements_per_comm}',
                      ranks=[0])
+            # 此时返回传入的单次最大通信大小
+            # 只需一次通信
             return max_elements_per_comm
 
+        # s_note: 现在需要至少2次通信
+        # dp代表一次通信分块进程数量块
+        # 上取整
+        # 每次通信的每个分块都padding一个元素
+        # num_elements / min_comm_intervals 表示现在需要的实际每次通信大小m
+        # m再除以dp得到x，x是每个分片的实际大小，这是有小数部分的数
+        # x上取整表示一个分片的实际大小
+        # z = x * (dp * min_comm_intervals) - num_elements
+        # z才是padding的数量
+        # s_quest: 这块没看懂？
         padding_for_min_comm = math.ceil(num_elements / (dp * min_comm_intervals))
 
         # choose padding that uses least amount of overhead
