@@ -256,6 +256,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             # set model fp16 weight to slices of flattened buffer
             # s_note: 这里把flatten成一维的参数又根据 self.fp16_groups[i] 里面的参数信息,
             #         恢复成原来的张量大小, 感觉操作是多余的, 他们自己的注释也说了
+            # s_note: updated_params是fp16_groups_flat按fp16_groups的shape创建的view
             updated_params = _unflatten_dense_tensors(self.fp16_groups_flat[i],
                                                       self.fp16_groups[i])
             for p, q in zip(self.fp16_groups[i], updated_params):
