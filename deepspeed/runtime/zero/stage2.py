@@ -74,9 +74,11 @@ def flatten_dense_tensors_aligned(tensor_list, alignment):
     return _flatten_dense_tensors(padded_tensor_list)
 
 
+# s_note: group内的参数list，alignment是进程数
 def get_alignment_padding(tensor_list, alignment):
     num_elements = sum([tensor.numel() for tensor in tensor_list])
     remainder = num_elements % alignment
+    # s_note: 按进程数等分，最后要补足的element数量
     return (alignment - remainder) if remainder else remainder
 
 
@@ -111,15 +113,16 @@ class FP16_DeepSpeedZeroOptimizer(object):
                  reduce_bucket_size=500000000,
                  allgather_bucket_size=5000000000,
                  dp_process_group=None,
-                 reduce_scatter=True,
-                 overlap_comm=False,
+                 reduce_scatter=True, # s_note: 使用reduce-scatter 或者 reduce来汇总梯度，默认是reduce_scatter
+                 overlap_comm=False, # s_note: Attempts to overlap the reduction of the gradients with backward computation
                  cpu_offload=False,
                  mpu=None,
                  clip_grad=0.0,
                  allreduce_always_fp32=False,
                  postscale_gradients=True,
                  gradient_predivide_factor=1.0,
-                 gradient_accumulation_steps=1):
+                 gradient_accumulation_steps=1, # s_note: Number of training steps to accumulate gradients before averaging and applying them
+                ):
 
         # Load pre-installed or JIT compile (un)flatten ops
         util_ops = UtilsBuilder().load()
@@ -141,6 +144,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
         # - master gard and unflat master weight never exist. TODO: a way to save out unflat master?
         if not torch.cuda.is_available:
             raise SystemError("Cannot use fp16 without CUDA.")
+        # s_note: PyTorch Optimizer
         self.optimizer = init_optimizer
 
         self.timers = timers
@@ -157,6 +161,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         self.dp_process_group = dp_process_group
 
+        # s_note: partition_count就是进程数
         self.partition_count = dist.get_world_size(group=self.dp_process_group)
 
         if mpu is None:
@@ -217,13 +222,16 @@ class FP16_DeepSpeedZeroOptimizer(object):
         # loop to deal with groups
         for i, param_group in enumerate(self.optimizer.param_groups):
             # push this group to list before modify
+            # s_note: 按group分的fp16的参数list
             self.fp16_groups.append(param_group['params'])
             # Record padding required to align group to world size
             if partition_id == dist.get_world_size(group=self.dp_process_group) - 1:
+                # s_note: 如果是最后一个进程
                 padding = get_alignment_padding(self.fp16_groups[i],
                                                 self.partition_count)
             else:
                 padding = 0
+            # s_note: 该group要padding的数量
             self.groups_padding.append(padding)
 
             #not sure why apex was cloning the weights before flattening
@@ -231,10 +239,12 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
             see_memory_usage(f"Before moving param group {i} to CPU")
             #move all the parameters to cpu to free up GPU space for creating flat buffer
+            # s_note: 把fp16参数move到cpu
             move_to_cpu(self.fp16_groups[i])
             see_memory_usage(f"After moving param group {i} to CPU")
 
             #create flat buffer in CPU and move to GPU
+            # s_note: flatten 后的fp16参数
             self.fp16_groups_flat.append(
                 flatten_dense_tensors_aligned(
                     self.fp16_groups[i],
@@ -247,6 +257,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     f"After Flattening and after emptying param group {i} cache")
 
             # set model fp16 weight to slices of flattened buffer
+            # s_note: updated_params是fp16_groups_flat按fp16_groups的shape创建的view
             updated_params = _unflatten_dense_tensors(self.fp16_groups_flat[i],
                                                       self.fp16_groups[i])
             for p, q in zip(self.fp16_groups[i], updated_params):
@@ -254,11 +265,14 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
             #divide the flat weights into near equal partition equal to the data parallel degree
             #each process will compute on a different part of the partition
+            # s_note: 按进程数均匀分片
             data_parallel_partitions = self.get_data_parallel_partitions(
                 self.fp16_groups_flat[i])
+            # s_note: 该参数group对应的进程数量个等长的fp16 tensor
             self.parallel_partitioned_fp16_groups.append(data_parallel_partitions)
 
             # a partition of the fp32 master weights that will be updated by this process
+            # s_note: 该rank要更新的那个fp32参数分片
             self.single_partition_of_fp32_groups.append(
                 self.parallel_partitioned_fp16_groups[i][partition_id].to(
                     self.device).clone().float().detach())
@@ -266,10 +280,13 @@ class FP16_DeepSpeedZeroOptimizer(object):
             # modify optimizer of have flat master weight
             self.single_partition_of_fp32_groups[
                 i].requires_grad = True  # keep this in case internal optimizer uses it
+            # s_note: 重置optimizer关联的参数为fp32的参数分片
             param_group['params'] = [self.single_partition_of_fp32_groups[i]]
 
+            # s_note: 按进程数均分，得到的一个分片的大小
             partition_size = len(self.fp16_groups_flat[i]) / dist.get_world_size(
                 group=self.dp_process_group)
+            # s_note: 本rank分片关联的参数fp16 参数tensor，这个分法比stage 1简单
             params_in_partition, params_not_in_partition, first_offset = self.get_partition_info(self.fp16_groups[i], partition_size, partition_id)
 
             self.partition_size.append(partition_size)
@@ -308,19 +325,25 @@ class FP16_DeepSpeedZeroOptimizer(object):
         for i, params_group in enumerate(self.fp16_groups):
             for param in params_group:
                 unique_id = id(param)
+                # s_note: 按参数顺序给参数编了号
                 self.param_id[unique_id] = count
+                # s_note: 建立参数id到参数的映射
                 self.param_dict[count] = param
+                # s_note: 记录该参数是否已经被reduce
                 self.params_already_reduced.append(False)
                 if param.numel() > largest_param_numel:
+                    # s_note: 最大的参数长度
                     largest_param_numel = param.numel()
                 count = count + 1
 
         for param_group in self.params_in_partition:
             for param in param_group:
+                # s_note: 用id记录该参数属于本rank的分片
                 self.is_param_in_current_partition[self.get_param_id(param)] = True
 
         for param_group in self.params_not_in_partition:
             for param in param_group:
+                # s_note: 用id记录该参数不属于本rank的分片
                 self.is_param_in_current_partition[self.get_param_id(param)] = False
 
         if self.cpu_offload:
@@ -369,12 +392,15 @@ class FP16_DeepSpeedZeroOptimizer(object):
         self.first_param_index_in_partition = {}
 
         #initializes all data structures for implementing gradient partitioning
+        # s_note: 初始化一些参数和partition的对应关系
         self.initialize_gradient_partitioning_data_structures()
 
         #resets the data structure value for the next backward propagation
+        # s_note: 初始化grad相关的数据情况
         self.reset_partition_gradient_structures()
 
         #creates backward hooks for gradient partitioning
+        # s_note:
         self.create_reduce_and_remove_grad_hooks()
 
         # we may have a way of fusing dynamic scale. Do not support for now
@@ -453,11 +479,15 @@ class FP16_DeepSpeedZeroOptimizer(object):
             self.first_param_index_in_partition[i] = {}
 
             for partition_id in range(total_partitions):
+                # s_note: 参数i的rank id分片grad是否计算了
                 self.is_grad_computed[i][partition_id] = {}
+                # s_note: 参数i的rank id分片grad的insertion_offset
                 self.grad_partition_insertion_offset[i][partition_id] = {}
+                # s_note: 参数i的rank id分片grad的start_offset
                 self.grad_start_offset[i][partition_id] = {}
                 self.total_grads_in_partition[i][partition_id] = 0
                 self.initialize_gradient_partition(i, param_group, partition_id)
+                # s_note: 参数i的rank id分片grad是否reduce了
                 self.is_partition_reduced[i][partition_id] = False
                 self.first_param_index_in_partition[i][
                     partition_id] = self.get_first_param_index(
@@ -465,6 +495,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
                         param_group,
                         partition_id)
 
+    # s_note: loss.backward()生成梯度后会立即调用这个函数
+    #         该函数在backward()后调用，在reduce最后一个ipg bucket的grad
+    #         之前backward()运行中，paramter的grad生成后，会调用acc_grad的hook，判断是否要做ipg bucket的grad reduce
     def independent_gradient_partition_epilogue(self):
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
         self.reduce_ipg_grads()
@@ -523,6 +556,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     self.is_grad_computed[i][partition_id][param_id] = False
 
     def initialize_gradient_partition(self, i, param_group, partition_id):
+        # s_note: 第i个参数
+        #         rank id为partition_id
+
         def set_key_value_list(dictionary, key, value):
             if key in dictionary:
                 dictionary[key].append(value)
@@ -537,6 +573,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         partition_size = self.partition_size[i]
 
+        # s_note: partition的起始index
         start_index = partition_size * partition_id
         end_index = partition_size * (partition_id + 1)
 
@@ -549,9 +586,12 @@ class FP16_DeepSpeedZeroOptimizer(object):
             param_id = self.get_param_id(param)
 
             if (current_index >= start_index and current_index < end_index):
+                # s_note: 如果当前参数和当前rank的partition有交集
+                #         param_to_partition_ids记录参数group i的参数param_id关联的rank id
                 set_key_value_list(self.param_to_partition_ids[i],
                                    param_id,
                                    partition_id)
+                # s_note: total_grads_in_partition记录参数group i在rank分片关联的梯度个数
                 increment_value(self.total_grads_in_partition[i], partition_id)
 
                 self.is_grad_computed[i][partition_id][param_id] = False
@@ -565,6 +605,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 assert (first_offset==0), "This can happen either zero or only once as this must be the first tensor in the partition"
                 first_offset = start_index - current_index
 
+                # s_note: 类似上面，这里处理当前分片和当前参数有交集的情况
                 set_key_value_list(self.param_to_partition_ids[i],
                                    param_id,
                                    partition_id)
@@ -577,6 +618,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
             current_index = current_index + param_size
 
+    # s_note: loss.backward()生成梯度后会立即调用这个函数
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.independent_gradient_partition_epilogue()
 
@@ -586,15 +628,22 @@ class FP16_DeepSpeedZeroOptimizer(object):
             for param in param_group:
                 if param.requires_grad:
 
+                    # s_note: 对于group i的一个参数param
                     def wrapper(param, i):
+                        # s_note: 等于param.expand(param.size())
+                        #         等于返回了和param一样shape的一个view，view名为param_tmp
                         param_tmp = param.expand_as(param)
+                        # s_note: 当前参数对应的梯度累积节点，梯度累积节点在计算完梯度后被调用，用于累积梯度
+                        #         参考：https://discuss.pytorch.org/t/in-the-grad-fn-i-find-a-next-functions-but-i-dont-understand-the-meaning-of-the-attribute/24463/3
                         grad_acc = param_tmp.grad_fn.next_functions[0][0]
 
-                        def reduce_partition_and_remove_grads(*notneeded):
-                            self.reduce_ready_partitions_and_remove_grads(param, i)
                         # s_note: 给 grad accumulate 注册 hook, 
                         #         在反向过程中, 当参数的梯度计算完成之后, 做reduce操作同步全局梯度, 
                         #         然后释放不属于本地参数分片的梯度, 来实现 gradient sharding
+                        # s_note: 把计算完grad的param加入待reduce的ipg bucket中
+                        #         如果 ipg_bucket 再加上这个参数触及了reduce的阈值，就先做bucket中梯度的reduce + fp16 grad的释放
+                        def reduce_partition_and_remove_grads(*notneeded):
+                            self.reduce_ready_partitions_and_remove_grads(param, i)
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
 
@@ -614,12 +663,15 @@ class FP16_DeepSpeedZeroOptimizer(object):
     ############### Independent Partition Gradient ########################
     def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
         if self.elements_in_ipg_bucket + param.numel() > self.reduce_bucket_size:
+            # s_note: 如果 ipg_bucket 再加上这个参数触及了reduce的阈值，就先做bucket中梯度的reduce + 释放
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.numel())
-            # s_note: 全局同步梯度, 然后释放非本地分片的梯度
+            # s_note: reduce bucket中的参数的梯度 + 释放当前bucket非本rank要更新的参数的梯度
             self.reduce_ipg_grads()
             if self.contiguous_gradients and self.overlap_comm:
                 # Swap ipg_index between 0 and 1
+                # s_note: 构建了两个ipg bucket
+                #         要overlap通信和backward的计算时，就切换ipg bucket
                 self.ipg_index = 1 - self.ipg_index
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads",
                                          param.numel())
@@ -640,6 +692,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             new_grad_tensor.copy_(param.grad.view(-1))
             param.grad.data = new_grad_tensor.data.view_as(param.grad)
 
+        # s_note: 把一个参数加到要reduce的bucket中
         self.elements_in_ipg_bucket += param.numel()
         self.grads_in_ipg_bucket.append(param.grad)
         self.params_in_ipg_bucket.append((i, param, param_id))
@@ -675,9 +728,11 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         return tensor
 
+    # s_note: reduce当前ipg bucket里面关联的grad分片
     def average_tensor(self, tensor):
         if self.overlap_comm:
             torch.cuda.synchronize()
+            # s_note: 为了overlap_comm，利用专门的reduction_stream
             stream = self.reduction_stream
         else:
             stream = torch.cuda.current_stream()
@@ -694,6 +749,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             rank_and_offsets = []
             curr_size = 0
             prev_id = -1
+            # s_note: reduce当前ipg bucket里面关联的grad分片
             for i, param, param_id in self.params_in_ipg_bucket:
                 partition_ids = self.param_to_partition_ids[i][param_id]
                 partition_size = self.partition_size[i]
@@ -728,16 +784,21 @@ class FP16_DeepSpeedZeroOptimizer(object):
             tensor.div_(dist.get_world_size(group=self.dp_process_group))
 
             async_handles = []
+            # s_note: reduce这次要同步的grad分片
             for dst, bucket_offset, numel in rank_and_offsets:
+                # s_note: grad分片
                 grad_slice = tensor.narrow(0, int(bucket_offset), int(numel))
                 dst_rank = _get_global_rank(self.dp_process_group, dst)
+                # s_note: reduce分片到其目的rank
                 async_handle = dist.reduce(grad_slice,
                                            dst=dst_rank,
                                            group=self.dp_process_group,
                                            async_op=True)
+                # s_note: 异步发送
                 async_handles.append(async_handle)
 
             for handle in async_handles:
+                # s_note: 同步等待
                 handle.wait()
 
     ##############################################################################
@@ -942,6 +1003,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
         #print(f"Grad norm after copy to contiguous_buffer {param.grad.data.norm()}")
         self.grads_in_partition_offset += param.numel()
 
+    # s_note: reduce bucket中的参数的梯度 + 释放当前bucket非本rank要更新的参数的梯度
     def reduce_ipg_grads(self):
         if self.overlap_comm:
             stream = self.reduction_stream
@@ -950,6 +1012,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         if self.contiguous_gradients:
             # s_note: 进行同步 reduce 操作
+            # s_note: reduce当前ipg bucket里面关联的grad分片
             self.average_tensor(self.ipg_buffer[self.ipg_index])
         else:
             self.buffered_reduce_fallback(
@@ -966,7 +1029,8 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     Multiple gradient reduction is currently not supported"
 
                 self.params_already_reduced[param_id] = True
-                # s_note: 释放非本地分片的梯度
+                # s_note: 释放和本rank要更新分片无关的参数的fp16梯度
+                # s_ques: 参数有关，但是参数中分片无关的也可以释放？
                 if not self.is_param_in_current_partition[param_id]:
                     if self.overlap_comm and self.contiguous_gradients is False:
                         # Clear the previous grads during the next reduction
@@ -975,6 +1039,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                             self.previous_reduced_grads = []
                         self.previous_reduced_grads.append(param)
                     else:
+                        # s_note: 释放非本rank分片的参数的梯度
                         param.grad = None
                 elif self.contiguous_gradients:
                     self.copy_grads_in_partition(param)
@@ -1138,30 +1203,41 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
     #views the tensor as multiple partitions and returns
     #those partitions
+    # s_note: tensor是一个1维flatten tensor
+    # s_note: 按进程数均匀分片
     def get_data_parallel_partitions(self, tensor):
         partitions = []
 
         dp = dist.get_world_size(group=self.dp_process_group)
+        # s_note: 当前的rank
         dp_id = dist.get_rank(group=self.dp_process_group)
 
         total_num_elements = tensor.numel()
 
+        # s_note: 每个进程分到的大小
         base_size = total_num_elements // dp
+        # s_note: 最后一部分不够分成dp个的
         remaining = total_num_elements % dp
 
         start = 0
         for id in range(dp):
             partition_size = base_size
             if id < remaining:
+                # s_note: 前remaining个进程，比base_size多1个
                 partition_size = partition_size + 1
             partitions.append(tensor.narrow(0, start, partition_size))
             start = start + partition_size
         return partitions
 
-    def get_partition_info(self, tensor_list, partition_size, partition_id):
+    def get_partition_info(self,
+        tensor_list,  # s_note: 一个group的fp16参数
+        partition_size,  # s_note: 分片大小
+        partition_id  # s_note: 本进程rank id
+        ):
         params_in_partition = []
         params_not_in_partition = []
 
+        # s_note: 本rank应该处理的参数元素的起始index
         start_index = partition_size * partition_id
         end_index = partition_size * (partition_id + 1)
 
@@ -1187,7 +1263,11 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
             current_index = current_index + tensor_size
 
-        return params_in_partition, params_not_in_partition, first_offset
+        return (
+            params_in_partition,  # s_note: 和本rank要处理分片有交集的参数tensor
+            params_not_in_partition, # s_note: 和本rank要处理分片无交集的参数tensor
+            first_offset  # s_note: 该分片处理的关联tensor的起始offset
+        )
 
     def zero_grad(self, set_grads_to_None=True):
         """
@@ -1330,6 +1410,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
         self.norm_for_param_grads = {}
         self.local_overflow = False
 
+    # s_note: stage 2的参数更新
     def step(self, closure=None):
         """
         Not supporting closure.
@@ -1388,6 +1469,8 @@ class FP16_DeepSpeedZeroOptimizer(object):
                                               self.params_in_partition[i]))
 
                 #free gradients for all the prameters that are not updated by this process
+                # s_note: 释放本rank无需更新的fp16参数的grad
+                #         其实backward acc_grad的hook中已经释放了
                 self.free_grad_in_param_list(self.params_not_in_partition[i])
 
                 #create a flat gradients for parameters updated by this process
@@ -1404,8 +1487,11 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 assert single_grad_partition.numel() == self.partition_size[i], \
                     "averaged gradients have different number of elements that partition size {} {} {} {}".format(single_grad_partition.numel(), self.partition_size[i], i, partition_id)
 
+                # s_note: fp32分片及其grad
                 self.single_partition_of_fp32_groups[i].grad = single_grad_partition
+
                 #release all the gradient since we have already created a necessary copy in dp_grad_partition
+                # s_note: 释放和本rank分片有关的fp16参数的grad
                 self.free_grad_in_param_list(self.params_in_partition[i])
 
                 self.averaged_gradients[i] = None
@@ -1430,14 +1516,17 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 for fp16_partitions, fp32_partition in zip(self.parallel_partitioned_fp16_groups, self.single_partition_of_fp32_groups):
                     fp16_partitions[partition_id].data.copy_(fp32_partition.data)
         else:
+            # 普通pytorch opt做fp32的更新
             self.optimizer.step()
 
             #get rid of the fp32 gradients. Not needed anymore
             if not self.cpu_offload:
+                # s_note: 释放fp32分片的grad
                 for group in self.single_partition_of_fp32_groups:
                     group.grad = None
 
             for fp16_partitions, fp32_partition in zip(self.parallel_partitioned_fp16_groups, self.single_partition_of_fp32_groups):
+                # s_note: fp16参数分片拷贝fp32参数分片的数据
                 fp16_partitions[partition_id].data.copy_(fp32_partition.data)
 
         timers('optimizer_step').stop()
@@ -1475,6 +1564,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                         num_elements).detach()
                     shard_list.append(curr_shard)
 
+                # s_note: all_gather fp16的参数
                 dist.all_gather(shard_list,
                                 shard_list[partition_id],
                                 group=self.dp_process_group)
@@ -1602,6 +1692,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                                 device=torch.cuda.current_device())
             self.ipg_buffer.append(buf_0)
 
+            # s_note: overlap_comm打开时，有bucket的double buff
             # Use double buffers to avoid data access conflict when overlap_comm is enabled.
             if self.overlap_comm:
                 buf_1 = torch.empty(int(self.reduce_bucket_size * 4.5),
