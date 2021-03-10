@@ -742,10 +742,14 @@ class FP16_DeepSpeedZeroOptimizer(object):
             # s_quest: torch.cuda.synchronize()的语义?
             #          Waits for all kernels in all streams on a CUDA device to complete
             #          等待之前提交的cuda任务都计算完成，保证grad生成好了?
+            # s_note: 这里把之前提交的backward op和reduce都要运行万
+            #         新的backward op和和reduce要等synchronize()
             torch.cuda.synchronize()
+            #         synchronize()之后，新的backward op和和reduce就可以overlap执行了
             # s_note: 为了overlap_comm，利用专门的reduction_stream
             stream = self.reduction_stream
         else:
+            # s_quest: 即使是计算和通信公用一个stream，也可以有一定程度的并行?
             stream = torch.cuda.current_stream()
 
         with torch.cuda.stream(stream):
@@ -1045,7 +1049,6 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
                 self.params_already_reduced[param_id] = True
                 # s_note: 释放和本rank要更新分片无关的参数的fp16梯度
-                # s_quest: 参数有关，但是参数中分片无关的也可以释放？
                 if not self.is_param_in_current_partition[param_id]:
                     if self.overlap_comm and self.contiguous_gradients is False:
                         # Clear the previous grads during the next reduction

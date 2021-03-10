@@ -823,6 +823,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         #RS: clear our sub partition grads
         #get rid of the fp32 gradients. Not needed anymore
         # s_note: 释放本地分片对应的 fp32 梯度
+        # s_quest: 这里不严谨，分片的g m v p同时存在了，这里才释放了g的，峰值是4份
         for group in self.local_sub_partitions_of_fp32_groups:
             for idx, sub_partition_param in enumerate(group):
                 sub_partition_param.grad = None
@@ -838,7 +839,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
 
         #RS: all_gather/broadcast sub-partitions in separate comm calls
         #gather the updated weights from everyone
-        # s_note: all_gather 获取全局更新之后的 fp16 梯度
+        # s_note: all_gather 获取全局更新之后的 fp16 参数
         for fp16_all_sub_partitions in self.parallel_comm_sub_partitioned_fp16_groups:
             for comm_id, sub_partitions in enumerate(fp16_all_sub_partitions):
                 dist.all_gather(sub_partitions,
