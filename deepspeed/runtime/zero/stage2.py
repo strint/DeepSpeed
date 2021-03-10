@@ -670,8 +670,8 @@ class FP16_DeepSpeedZeroOptimizer(object):
             self.reduce_ipg_grads()
             if self.contiguous_gradients and self.overlap_comm:
                 # Swap ipg_index between 0 and 1
-                # s_note: 构建了两个ipg bucket
-                #         要overlap通信和backward的计算时，就切换ipg bucket
+                # s_note: 构建了两个ipg bucket buff
+                #         要overlap通信和backward的计算时，当前grad reduce通信用一个buff，写新grad就切换到另外一个ipg bucket buff
                 self.ipg_index = 1 - self.ipg_index
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads",
                                          param.numel())
@@ -689,7 +689,10 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 0,
                 self.elements_in_ipg_bucket,
                 param.numel())
+            # s_note: 把grad复制到bucket buff的tensor中
             new_grad_tensor.copy_(param.grad.view(-1))
+            # s_note: 用buff的tensor替换到param的grad中
+            #         所以参数的grad在通信时，使用的是bucket buff
             param.grad.data = new_grad_tensor.data.view_as(param.grad)
 
         # s_note: 把一个参数加到要reduce的bucket中
@@ -729,6 +732,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
         return tensor
 
     # s_note: reduce当前ipg bucket里面关联的grad分片
+    #         tensor是一个bucket buff，里面是之前累积的fp16的参数的grad
     def average_tensor(self, tensor):
         if self.overlap_comm:
             torch.cuda.synchronize()
@@ -749,7 +753,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             rank_and_offsets = []
             curr_size = 0
             prev_id = -1
-            # s_note: reduce当前ipg bucket里面关联的grad分片
+            # s_note: 对于bucket关联的每个参数，获取其grad分片信息
             for i, param, param_id in self.params_in_ipg_bucket:
                 partition_ids = self.param_to_partition_ids[i][param_id]
                 partition_size = self.partition_size[i]
@@ -784,7 +788,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             tensor.div_(dist.get_world_size(group=self.dp_process_group))
 
             async_handles = []
-            # s_note: reduce这次要同步的grad分片
+            # s_note: 对于bucket关联的每个参数的每个grad分片，进行reduce
             for dst, bucket_offset, numel in rank_and_offsets:
                 # s_note: grad分片
                 grad_slice = tensor.narrow(0, int(bucket_offset), int(numel))
@@ -1039,7 +1043,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                             self.previous_reduced_grads = []
                         self.previous_reduced_grads.append(param)
                     else:
-                        # s_note: 释放非本rank分片的参数的梯度
+                        # s_note: 释放非本rank分片的参数的梯度，以参数为粒度的
                         param.grad = None
                 elif self.contiguous_gradients:
                     self.copy_grads_in_partition(param)
@@ -1687,12 +1691,14 @@ class FP16_DeepSpeedZeroOptimizer(object):
         #TODO: we need to revist this and remove the magic 4.5x multiplier here
         if self.contiguous_gradients:
             self.ipg_buffer = []
+            # s_note: fp16 grad的bucket buff 0
             buf_0 = torch.empty(int(self.reduce_bucket_size * 4.5),
                                 dtype=torch.half,
                                 device=torch.cuda.current_device())
             self.ipg_buffer.append(buf_0)
 
-            # s_note: overlap_comm打开时，有bucket的double buff
+            # s_note: fp16 grad的bucket buff 1
+            #         overlap_comm打开时，有bucket的double buff
             # Use double buffers to avoid data access conflict when overlap_comm is enabled.
             if self.overlap_comm:
                 buf_1 = torch.empty(int(self.reduce_bucket_size * 4.5),
