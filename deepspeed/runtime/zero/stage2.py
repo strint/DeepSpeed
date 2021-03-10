@@ -500,6 +500,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
     #         之前backward()运行中，paramter的grad生成后，会调用acc_grad的hook，判断是否要做ipg bucket的grad reduce
     def independent_gradient_partition_epilogue(self):
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
+        # s_note: 这里调用reduce
         self.reduce_ipg_grads()
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
@@ -509,6 +510,8 @@ class FP16_DeepSpeedZeroOptimizer(object):
             self.params_already_reduced[i] = False
 
         if self.overlap_comm:
+            # s_quest: 这里的作用？
+            #         Waits for all kernels in all streams on a CUDA device to complete
             torch.cuda.synchronize()
 
         if self.cpu_offload is False:
@@ -533,6 +536,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     for accumulated_grad, new_avg_grad in zip(self.averaged_gradients[i],avg_new):
                         accumulated_grad.add_(new_avg_grad)
 
+        # s_note: 清理掉在backward()阶段申请的grad buff bucket
         self._release_ipg_buffers()
 
         # No need to keep the gradients anymore.
@@ -735,6 +739,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
     #         tensor是一个bucket buff，里面是之前累积的fp16的参数的grad
     def average_tensor(self, tensor):
         if self.overlap_comm:
+            # s_quest: torch.cuda.synchronize()的语义?
+            #          Waits for all kernels in all streams on a CUDA device to complete
+            #          等待之前提交的cuda任务都计算完成，保证grad生成好了?
             torch.cuda.synchronize()
             # s_note: 为了overlap_comm，利用专门的reduction_stream
             stream = self.reduction_stream
@@ -794,6 +801,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 grad_slice = tensor.narrow(0, int(bucket_offset), int(numel))
                 dst_rank = _get_global_rank(self.dp_process_group, dst)
                 # s_note: reduce分片到其目的rank
+                # s_note: overlap_comm打开时，reduce这里使用的是是独立的reduction_stream
                 async_handle = dist.reduce(grad_slice,
                                            dst=dst_rank,
                                            group=self.dp_process_group,
@@ -802,7 +810,10 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 async_handles.append(async_handle)
 
             for handle in async_handles:
-                # s_note: 同步等待
+                # s_quest: Makes all future work submitted to the given stream wait for this event
+                #          把之前提交到当前cuda stream的reduce任务优先级提到比后面任务都高
+                #          cudaStreamWaitEvent, https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g7840e3984799941a61839de40413d1d9
+                # s_note: 如果是独立的reduction stream，那么grad计算就还可以独立运行
                 handle.wait()
 
     ##############################################################################
@@ -1034,7 +1045,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
                 self.params_already_reduced[param_id] = True
                 # s_note: 释放和本rank要更新分片无关的参数的fp16梯度
-                # s_ques: 参数有关，但是参数中分片无关的也可以释放？
+                # s_quest: 参数有关，但是参数中分片无关的也可以释放？
                 if not self.is_param_in_current_partition[param_id]:
                     if self.overlap_comm and self.contiguous_gradients is False:
                         # Clear the previous grads during the next reduction
@@ -1044,6 +1055,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                         self.previous_reduced_grads.append(param)
                     else:
                         # s_note: 释放非本rank分片的参数的梯度，以参数为粒度的
+                        # s_note: overlap_comm打开时，这里释放grad使用的也是独立的reduction_stream
                         param.grad = None
                 elif self.contiguous_gradients:
                     self.copy_grads_in_partition(param)
@@ -1690,6 +1702,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         #TODO: we need to revist this and remove the magic 4.5x multiplier here
         if self.contiguous_gradients:
+            # s_note: 每次backward时，创建grad bucket buff
             self.ipg_buffer = []
             # s_note: fp16 grad的bucket buff 0
             buf_0 = torch.empty(int(self.reduce_bucket_size * 4.5),
