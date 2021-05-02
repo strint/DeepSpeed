@@ -512,6 +512,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
         if self.overlap_comm:
             # s_quest: 这里的作用？
             #         Waits for all kernels in all streams on a CUDA device to complete
+            #         这个同步粒度更大点，以bucket为粒度，使得bucket内部的计算和通信可以异步进行
             torch.cuda.synchronize()
 
         if self.cpu_offload is False:
@@ -647,6 +648,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                         # s_note: 把计算完grad的param加入待reduce的ipg bucket中
                         #         如果 ipg_bucket 再加上这个参数触及了reduce的阈值，就先做bucket中梯度的reduce + fp16 grad的释放
                         def reduce_partition_and_remove_grads(*notneeded):
+                            # s_note: 应该有ready partition check
                             self.reduce_ready_partitions_and_remove_grads(param, i)
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
@@ -740,12 +742,13 @@ class FP16_DeepSpeedZeroOptimizer(object):
     def average_tensor(self, tensor):
         if self.overlap_comm:
             # s_quest: torch.cuda.synchronize()的语义?
-            #          Waits for all kernels in all streams on a CUDA device to complete
+            #          调用的cudaDeviceSynchronize()
+            #          Host cpu waits for all kernels in all streams on a CUDA device to complete
             #          等待之前提交的cuda任务都计算完成，保证grad生成好了?
             # s_note: 这里把之前提交的backward op和reduce都要运行万
             #         新的backward op和和reduce要等synchronize()
             torch.cuda.synchronize()
-            #         synchronize()之后，新的backward op和和reduce就可以overlap执行了
+            #         synchronize()之后，新的backward op和reduce就可以overlap执行了
             # s_note: 为了overlap_comm，利用专门的reduction_stream
             stream = self.reduction_stream
         else:
@@ -817,7 +820,10 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 # s_quest: Makes all future work submitted to the given stream wait for this event
                 #          把之前提交到当前cuda stream的reduce任务优先级提到比后面任务都高
                 #          cudaStreamWaitEvent, https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g7840e3984799941a61839de40413d1d9
+                #          这里后面的计算也要等待通信的完成
+                #          但是CPU不阻塞在这里，这是和synchronize()的不同
                 # s_note: 如果是独立的reduction stream，那么grad计算就还可以独立运行
+                # 这些wait()/synchronize()使得设备上可以完成这个批次的通信和计算，释放的显存就可以给后面的批次使用
                 handle.wait()
 
     ##############################################################################
